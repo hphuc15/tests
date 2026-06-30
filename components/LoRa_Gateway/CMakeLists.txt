@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "lora_platform_esp32.c"
+        "lora_gateway.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        LoRa
+        driver
+)
