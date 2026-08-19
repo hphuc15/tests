@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_attr.h"
 
 namespace
 {
@@ -40,10 +41,14 @@ static ILI9341::Status ToStatus(esp_err_t err)
 // SpiWrite() stays blocking/polling, used by SpiIo::TxParam for small
 // command/parameter transfers where pipelining has no benefit.
 //
-// SpiWriteAsync()/SpiWaitIdle() override the Hal defaults to use
-// spi_device_queue_trans() instead, so SpiIo::TxColor() can pipeline large
-// framebuffer transfers across multiple in-flight transactions instead of
-// blocking on each chunk in turn.
+// SpiWriteAsync() overrides the Hal default to use spi_device_queue_trans(),
+// so SpiIo::TxColor() can pipeline large framebuffer transfers across
+// multiple in-flight transactions instead of blocking on each chunk.
+//
+// RegisterTransDoneCallback() lets the caller (e.g. an LVGL flush callback)
+// find out when the *last* queued chunk has actually finished on the bus,
+// via the SPI driver's post_cb -- fired from ISR context, so the registered
+// callback and everything it touches must be IRAM-safe.
 class Esp32Hal : public ILI9341::Hal
 {
 public:
@@ -84,6 +89,7 @@ public:
         devCfg.mode = 0;
         devCfg.spics_io_num = kPinCs;
         devCfg.queue_size = kSpiQueueDepth;
+        devCfg.post_cb = &Esp32Hal::OnTransDoneTrampoline; // fires in ISR context
 
         err = spi_bus_add_device(kSpiHost, &devCfg, &spiDev_);
         if (err != ESP_OK)
@@ -148,7 +154,10 @@ public:
     // blocks only long enough to reclaim one completed slot -- not until the
     // new transaction itself finishes -- so several chunks can be in flight
     // at once while TxColor() prepares/queues the next one.
-    ILI9341::Status SpiWriteAsync(const uint8_t *data, size_t len) override
+    //
+    // isLastChunk marks the transaction whose completion should fire the
+    // registered TransDoneCallback (post_cb only checks trans.user).
+    ILI9341::Status SpiWriteAsync(const uint8_t *data, size_t len, bool isLastChunk) override
     {
         if (len == 0)
         {
@@ -170,6 +179,9 @@ public:
         memset(t, 0, sizeof(*t));
         t->length = len * 8;
         t->tx_buffer = data;
+        // Non-null only on the final chunk -- OnTransDoneTrampoline() uses this
+        // to avoid firing the callback on intermediate chunks.
+        t->user = isLastChunk ? this : nullptr;
 
         esp_err_t err = spi_device_queue_trans(spiDev_, t, portMAX_DELAY);
         if (err != ESP_OK)
@@ -181,9 +193,9 @@ public:
         return ILI9341::Status::Ok;
     }
 
-    // Drains every transaction still in flight. SpiIo::TxColor() calls this
-    // once after the chunk loop, and also on error, before it is safe to
-    // change the DC pin level or start a different SPI transaction.
+    // Drains every transaction still in flight. SpiIo::TxParam() calls this
+    // once at the start of every call, before it is safe to change the DC
+    // pin level or start a different SPI transaction.
     ILI9341::Status SpiWaitIdle() override
     {
         while (inflight_ > 0)
@@ -199,17 +211,40 @@ public:
         return ILI9341::Status::Ok;
     }
 
+    void RegisterTransDoneCallback(TransDoneCallback cb, void *userCtx) override
+    {
+        doneCb_ = cb;
+        doneCbCtx_ = userCtx;
+    }
+
     size_t GetMaxTransferSize() override
     {
         return maxTransferSize_;
     }
 
 private:
+    // Runs in ISR context (SPI driver post_cb). Must stay in IRAM and must
+    // not call anything that isn't IRAM-safe, including doneCb_ itself.
+    static void IRAM_ATTR OnTransDoneTrampoline(spi_transaction_t *trans)
+    {
+        if (trans->user == nullptr)
+        {
+            return; // not the final chunk of this TxColor() call
+        }
+        Esp32Hal *self = static_cast<Esp32Hal *>(trans->user);
+        if (self->doneCb_ != nullptr)
+        {
+            self->doneCb_(self->doneCbCtx_);
+        }
+    }
+
     spi_device_handle_t spiDev_ = nullptr;
     size_t maxTransferSize_ = 4092;
     spi_transaction_t *transPool_ = nullptr;
     size_t nextSlot_ = 0;
     size_t inflight_ = 0;
+    TransDoneCallback doneCb_ = nullptr;
+    void *doneCbCtx_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------
